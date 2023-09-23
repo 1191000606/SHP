@@ -1,20 +1,17 @@
 from __future__ import print_function
-import pickle
-import pandas as pd
 import numpy as np
+import pandas as pd
+import pickle
 from tqdm import tqdm
 import networkx as nx
 from itertools import count, product
 from Generate_Hawkes_data_from_tick import generate_data
 from functools import partialmethod
-import numpy
 
 import debugpy
-
-# debugpy.connect(('192.168.1.50', 6789)) # 与跳板机链接，"192.168.1.50"是hpc跳板机内网IP，6789是跳板机接收调试信息的端口
-# debugpy.wait_for_client() # 等待跳板机的相应
-# debugpy.breakpoint() # 断点。一般而言直接在vscode界面上打断点即可。这个通过代码的方式提供一个断点，否则如果忘了在界面上打断点程序就会一直运行，除非点击停止按钮。
-
+debugpy.connect(('192.168.1.50', 6789))
+debugpy.wait_for_client()
+debugpy.breakpoint()
 
 #tqdm.__init__ = partialmethod(tqdm.__init__, disable=True)
 
@@ -54,12 +51,15 @@ class SHP(object):
 
         # set the start timestamp to zero
         for seq_id in np.unique(self.event_table["seq_id"].values):
-            seq_index = self.event_table[self.event_table["seq_id"] == seq_id].index.tolist()
-            self.event_table.loc[seq_index, "max_time_stamp"] = \
-                self.event_table.loc[seq_index]["max_time_stamp"] - self.event_table.loc[seq_index]["time_stamp"].min()
-            self.event_table.loc[seq_index, "time_stamp"] = \
-                self.event_table.loc[seq_index]["time_stamp"] - self.event_table.loc[seq_index]["time_stamp"].min()
+            seq_index = self.event_table[self.event_table["seq_id"] == seq_id].index.tolist() # 获取该seq_id/device_id所有的记录的下标
+            # 该device的最大时刻（都是一样的），减去该device第一次出现的时刻，所有的该device的记录这一条都是一样的
+            self.event_table.loc[seq_index, "max_time_stamp"] = self.event_table.loc[seq_index]["max_time_stamp"] - self.event_table.loc[seq_index]["time_stamp"].min()
+            # 该device所有的时刻，也都减去该device第一次出现的时刻，让每一个device第一次出现的时刻都为0
+            self.event_table.loc[seq_index, "time_stamp"] = self.event_table.loc[seq_index]["time_stamp"] - self.event_table.loc[seq_index]["time_stamp"].min()
 
+        # 注意了，seq_id就是device_id，一共40个，序号为[0, 39]
+        # event_type一共20个，范围是[0, 19]
+        
         # store the calculated likelihood
         self.hist_likelihood = dict()
         for i in range(len(self.event_names)):
@@ -67,13 +67,13 @@ class SHP(object):
 
         if penalty not in {'BIC', 'AIC'}:
             raise Exception('Penalty is not supported')
+        
         self.penalty = penalty
-
         self.decay = decay  # the decay coefficient of kappa function
         self.n = len(self.event_names)  # num of event type
+        # 将每一个device_id的所有记录聚类在一起，取其中时刻最大的。然后所有device_id对应的结果相加。注意，在此之前有时刻偏移的操作
         self.T = self.event_table.groupby('seq_id').apply(lambda i: (i['time_stamp'].max())).sum()  # total time span
-        self.T_each_seq = self.event_table.groupby('seq_id'). \
-            apply(lambda i: (i['time_stamp'].max()))  # the last moment of each event sequence
+        self.T_each_seq = self.event_table.groupby('seq_id').apply(lambda i: (i['time_stamp'].max()))  # the last moment of each event sequence
 
         # Initializing Structs
         if init_structure is None:
@@ -86,9 +86,14 @@ class SHP(object):
         X_dict = dict()
         for seq_id, time_stamp, _, times, type_ind, _ in self.event_table.values:
             if (seq_id, time_stamp) not in X_dict:
-                X_dict[(seq_id, time_stamp)] = [0] * self.n
-            X_dict[(seq_id, time_stamp)][type_ind] = times
-        self.X_df = pd.DataFrame(X_dict).T
+                X_dict[(seq_id, time_stamp)] = [0] * self.n # self.n is num of event type
+            X_dict[(seq_id, time_stamp)][type_ind] = times # X_dict是 （设备序号，时刻） 发生了 发生了 多少次 某个类型的event.
+        
+        # X_dict是device_id和时刻作为键，event_type和times的对应关系作为值。或者应该是[(device_id, timestamp), event_type]——>times
+        # pd.DataFrame(X_dict)是 20行，7074列，也就是一个event一行。7074是每个设备，以及时刻。数据还是次数。
+        # pd.DataFrame(X_dict)也就是[event_type, (device_id, timestamp)]——>times。（device_id，timestamp）一共7074个
+        # 那么self.X_df也就是[(device_id, timestamp), event_type]，所以也就是7074 * 20的shape
+        self.X_df = pd.DataFrame(X_dict).T 
 
         self.X = self.X_df.values
         self.sum_t_X_kappa, self.decay_effect_integral_to_T = self.calculate_influence_of_each_event()
@@ -98,13 +103,15 @@ class SHP(object):
         sum_t_X_kappa = np.zeros_like(self.X, dtype='float64')
         decay_effect_integral_to_T = self.X_df.copy()
 
-        for ind, (seq_id, time_stamp) in enumerate(self.X_df.index):
+        for ind, (seq_id, time_stamp) in tqdm(enumerate(self.X_df.index)):
             # calculate the integral of decay function on time
-            decay_effect_integral_to_T.iloc[ind] = \
-                self.X_df.iloc[ind] * ((1 - np.exp(-self.decay * (self.T_each_seq[seq_id] - time_stamp))) / self.decay)
-
+            # self.T_each_seq是(40,)的数组，是每个device的最大timestamp，注意这个是时刻偏移过的（以该device最早发生的时刻为0）。
+            # 这里的ind是0～7074。在该ind下，device_id和time_stamp是固定的，有了这个时间和该device最后发生的时间，就可以有一个衰减系数。
+            # 然后self.X_df.iloc[ind]的shape是（20，），也就是20个event_type发生的次数。这个次数和上面的衰减系数相乘。
+            decay_effect_integral_to_T.iloc[ind] = self.X_df.iloc[ind] * ((1 - np.exp(-self.decay * (self.T_each_seq[seq_id] - time_stamp))) / self.decay)
             start_ind = ind
             start_seq_id, start_time_stamp = self.X_df.index[start_ind]
+            
             # the influence on subsequent timestamp when the event occurs
             next_ind = start_ind
             while start_seq_id == seq_id:  # the influence only spread on the same sequence
@@ -329,13 +336,15 @@ class SHP(object):
                 return result
 
 
-def run_SHP(dataset_index=1, penalty='BIC', model_decay=0.35, time_interval=5, hill_climb=True, reg=0.85):
-    alarm_data = pd.read_csv(f"./datasets/dataset_{dataset_index}/alarm.csv")
-    event_table = alarm_data.rename(columns={'alarm_id':'event_type', "device_id": "seq_id", "start_timestamp": "time_stamp"})
-    event_table = event_table.drop("end_timestamp", axis=1)
-
-    order = ['seq_id', 'time_stamp', 'event_type']
-    event_table = event_table[order]
+def SHP_exp(n, sample_size, out_degree_rate, mu_range_str, alpha_range_str, decay, penalty='BIC',
+            NE_num=40, model_decay=0.35, seed=0,
+            time_interval=5, hill_climb=True, reg=0.85):
+    event_table, real_edge_mat, real_alpha, real_mu, events = generate_data(n=n, sample_size=sample_size,
+                                                                            out_degree_rate=out_degree_rate,
+                                                                            mu_range_str=mu_range_str,
+                                                                            alpha_range_str=alpha_range_str,
+                                                                            NE_num=NE_num, decay=decay,
+                                                                            seed=seed)
 
     param_dict = {
         "decay": model_decay,
@@ -346,14 +355,34 @@ def run_SHP(dataset_index=1, penalty='BIC', model_decay=0.35, time_interval=5, h
 
     self = SHP(event_table, **param_dict)
     if hill_climb:
-        result = self.Hill_Climb()
+        res1 = self.Hill_Climb()
     else:
-        result = self.EM_not_HC(np.ones([self.n, self.n]) - np.eye(self.n, self.n))
+        res1 = self.EM_not_HC(np.ones([self.n, self.n]) - np.eye(self.n, self.n))
 
-    return result
+    likelihood = res1[0]
+    fited_alpha = res1[1]
+    fited_mu = res1[2]
+
+    return likelihood, fited_alpha, fited_mu, real_edge_mat, real_alpha, real_mu
 
 
-if __name__=='__main__':    
-    index = 4
-    result = run_SHP(dataset_index=index, model_decay=0.35, time_interval=100, penalty='BIC', hill_climb=True, reg=0.85)
-    pickle.dump(result, open(f"result{index}.pkl", "wb"))
+if __name__=='__main__':
+    from utils import get_performance
+
+    likelihood, fited_alpha, fited_mu, real_edge_mat, real_alpha, real_mu = SHP_exp(n=20, sample_size=20000,
+                                                                                    out_degree_rate=1.5,
+                                                                                    mu_range_str="0.00005,0.0001",
+                                                                                    alpha_range_str="0.5,0.7",
+                                                                                    decay=5, model_decay=0.35, seed=0,
+                                                                                    time_interval=5, penalty='BIC',
+                                                                                    hill_climb=True, reg=0.85)
+    pickle.dump((likelihood, fited_alpha, fited_mu), open("test_result.pkl", "wb"))
+    res = get_performance(fited_alpha, real_edge_mat)
+    print(res)
+    a, b, c = pickle.load(open("test_result.pkl", "rb"))
+    if a == likelihood:
+        print("yes a")
+    if b.all() == fited_alpha.all():
+        print("yes b")
+    if c.all() == fited_mu.all():
+        print("yes c")
